@@ -484,8 +484,8 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
     x_col = next((c for c in all_cols if '좌표' in c and ('x' in c.lower() or 'X' in c)), None)
     y_col = next((c for c in all_cols if '좌표' in c and ('y' in c.lower() or 'Y' in c)), None)
     
-    desired_patterns = ['소재지전체주소', '사업장명', '업태구분명', '영업상태명', 
-                        '소재지전화', '총면적', '소재지면적', '인허가일자', '폐업일자', 
+    desired_patterns = ['소재지전체주소', '지번주소', '사업장명', '업태구분명', '영업상태명', 
+                        '소재지전화', '소재지전화번호', '총면적', '소재지면적', '인허가일자', '폐업일자', 
                         '재개업일자', '최종수정시점', '데이터기준일자']
     
     rename_map = {}
@@ -511,15 +511,17 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
             selected_cols.append(match)
             rename_map[match] = pat
             
-    # [FIX] Robust Coordinate Mapping for epsg5174 suffixes
+    # [FIX] Robust Coordinate Mapping: Try common variations
+    coord_x_pats = ['좌표정보(X)', '좌표정보x', '좌표x', 'x좌표']
+    coord_y_pats = ['좌표정보(Y)', '좌표정보y', '좌표y', 'y좌표']
+    
     if not x_col:
-        x_col = next((c for c in all_cols if '좌표' in c and ('x' in c.lower() or 'X' in c)), None)
+        x_col = next((c for c in all_cols if any(p in c.lower() for p in coord_x_pats)), None)
     if not y_col:
-        y_col = next((c for c in all_cols if '좌표' in c and ('y' in c.lower() or 'Y' in c)), None)
+        y_col = next((c for c in all_cols if any(p in c.lower() for p in coord_y_pats)), None)
 
     if x_col: 
         selected_cols.append(x_col)
-        # Ensure it's not already in rename_map
         if x_col not in rename_map: rename_map[x_col] = '좌표정보(X)'
     if y_col: 
         selected_cols.append(y_col)
@@ -532,14 +534,20 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
     target_df.rename(columns=rename_map, inplace=True)
     
     # [FIX] Address Standardization
-    # Ensure '소재지전체주소' exists for key generation
+    # Prioritize '소재지전체주소' then '지번주소' then '도로명전체주소'
     if '소재지전체주소' not in target_df.columns:
-        if '도로명전체주소' in target_df.columns:
+        if '지번주소' in target_df.columns:
+            target_df.rename(columns={'지번주소': '소재지전체주소'}, inplace=True)
+        elif '도로명전체주소' in target_df.columns:
             target_df['소재지전체주소'] = target_df['도로명전체주소']
         elif '도로명주소' in target_df.columns:
-             target_df['소재지전체주소'] = target_df['도로명주소']
+            target_df['소재지전체주소'] = target_df['도로명주소']
         elif '주소' in target_df.columns:
              target_df['소재지전체주소'] = target_df['주소']
+    
+    # [FIX] Phone Standardization
+    if '소재지전화' not in target_df.columns and '소재지전화번호' in target_df.columns:
+        target_df.rename(columns={'소재지전화번호': '소재지전화'}, inplace=True)
 
     # [NEW] Normalize Status Values for app.py strict checks
     if '영업상태명' in target_df.columns:
