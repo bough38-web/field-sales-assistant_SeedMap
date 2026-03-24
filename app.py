@@ -1207,7 +1207,7 @@ if uploaded_dist:
                  dist_mtime = os.path.getmtime(uploaded_dist)
                  
              # [FIX] Unpack 4 values (df, mgr_info, error, stats)
-             raw_df, mgr_info_list, error, stats = data_loader.load_and_process_data(uploaded_zip, uploaded_dist, dist_mtime=dist_mtime)
+             raw_df, mgr_info_list, error, stats = data_loader.load_and_process_data(uploaded_zip, uploaded_dist, salt=dist_mtime)
              
              if stats:
                  # [FEATURE] Store data stats in session state for later "Help" (?) query
@@ -1269,19 +1269,34 @@ if raw_df is not None:
     if raw_df is None:
         raw_df = pd.DataFrame()
 
+    # [NEW] Global Data Normalization: "평수" & Date Standardization
+    if not raw_df.empty:
+        # 1. Normalize "평수" (Area in Pyung)
+        if '평수' not in raw_df.columns:
+            if '소재지면적' in raw_df.columns:
+                raw_df['평수'] = pd.to_numeric(raw_df['소재지면적'], errors='coerce').fillna(0) / 3.3058
+            elif '총면적' in raw_df.columns:
+                raw_df['평수'] = pd.to_numeric(raw_df['총면적'], errors='coerce').fillna(0) / 3.3058
+            else:
+                raw_df['평수'] = 0.0
+        else:
+            raw_df['평수'] = pd.to_numeric(raw_df['평수'], errors='coerce').fillna(0.0)
+
+        # 2. Standardize Date Columns to be Timezone-Naive
+        for col in ['인허가일자', '폐업일자', '최종수정시점', '데이터기준일자']:
+            if col in raw_df.columns:
+                # [FIX] Use utc=True to safely handle mixed aware/naive, then neutralize to naive
+                raw_df[col] = pd.to_datetime(raw_df[col], errors='coerce', utc=True).dt.tz_localize(None)
+
     # [FEATURE] Determine the actual latest date in the dataset to use instead of wall-clock time
     # This prevents the 15-day filters from returning 0 results if the dataset is older than 15 days.
-    GLOBAL_MAX_DATE = utils.get_now_kst().normalize()
+    GLOBAL_MAX_DATE = utils.get_now_kst().normalize().replace(tzinfo=None)
     if not raw_df.empty:
         date_candidates = []
         for col in ['최종수정시점', '인허가일자', '폐업일자']:
             if col in raw_df.columns:
-                 # Get max date safely
-                 # [FIX] Ensure they are all tz-aware for comparison if they are not already
-                 series = pd.to_datetime(raw_df[col], errors='coerce')
-                 if series.dt.tz is None:
-                     series = series.dt.tz_localize('Asia/Seoul')
-                 max_val = series.max()
+                 # [FIX] Use already normalized naive datetime series
+                 max_val = raw_df[col].max()
                  if pd.notna(max_val):
                      date_candidates.append(max_val)
         if date_candidates:
@@ -1290,7 +1305,7 @@ if raw_df is not None:
     # [FIX] Capping GLOBAL_MAX_DATE to `Today - 2 days` 
     # The public data has a strict 2-day ingestion delay. 
     # Prevent future dataset typos (e.g., 2026-03-03) from extending the UI end date.
-    max_allowed_date = utils.get_now_kst().normalize() - pd.Timedelta(days=2)
+    max_allowed_date = utils.get_now_kst().normalize().replace(tzinfo=None) - pd.Timedelta(days=2)
     if GLOBAL_MAX_DATE > max_allowed_date:
         GLOBAL_MAX_DATE = max_allowed_date
 
@@ -4331,13 +4346,13 @@ if raw_df is not None:
         st.markdown("---")
         
         from src import utils
-        now = utils.get_now_kst()
+        now = utils.get_now_kst().replace(tzinfo=None)
+        # [FIX] Use globally standardized '인허가일자'
         if '인허가일자' in df.columns:
+            # We already neutralized tzone at the top, just need to ensure 'now' is also naive
             valid_dates = df.dropna(subset=['인허가일자']).copy()
             if not valid_dates.empty:
-                if not pd.api.types.is_datetime64_any_dtype(valid_dates['인허가일자']):
-                     valid_dates['인허가일자'] = pd.to_datetime(valid_dates['인허가일자'], errors='coerce')
-                
+                # Calculate avg age using standardized naive datetimes
                 valid_dates['business_years'] = (now - valid_dates['인허가일자']).dt.days / 365.25
                 avg_age = valid_dates['business_years'].mean()
             else:
@@ -4345,13 +4360,8 @@ if raw_df is not None:
         else:
             avg_age = 0
             
-        if '평수' not in df.columns:
-             if '소재지면적' in df.columns:
-                 df['평수'] = pd.to_numeric(df['소재지면적'], errors='coerce').fillna(0) / 3.3058
-             else:
-                 df['평수'] = 0
-        
-        avg_area = df['평수'].mean()
+        # [FIX] '평수' is already calculated globally
+        avg_area = df['평수'].mean() if '평수' in df.columns else 0
         
         def extract_dong(addr):
              if pd.isna(addr): return "미상"
@@ -4510,7 +4520,7 @@ if raw_df is not None:
                             <div class="status-badge {status_cls}">{row['영업상태명']}</div>
                             <div class="card-title-grid" title="{row['사업장명']}">{row['사업장명']}</div>
                             <div class="card-meta-grid">
-                                {row['업태구분명']} | {row['평수']}평<br>
+                                {row.get('업태구분명', '-')} | {row.get('평수', '-')}평<br>
                                 {row['관리지사']} ({row['SP담당']})<br>
                                 <span style="color:#7C4DFF">🔄 {last_modified or '-'}</span> | 
                                 <span style="color:#1565C0">✨ {permit_date or '-'}</span>

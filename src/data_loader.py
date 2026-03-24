@@ -52,7 +52,7 @@ def _process_and_merge_district_data(target_df: pd.DataFrame, district_file_path
         if addr_col:
             df_district['full_address'] = df_district[addr_col]
         else:
-            return target_df, [], "District file must contain an address column (e.g., '주소' or '설치주소').", {}
+            return target_df, [], "District file must contain an address column (e.g., '주소' or '설치주소')."
 
     # Try candidate names for Branch
     branch_col = next((c for c in df_district.columns if any(p in c for p in ['관리지사', '지사'])), None)
@@ -79,287 +79,83 @@ def _process_and_merge_district_data(target_df: pd.DataFrame, district_file_path
     # 3. Prepare Target Data for Matching
     # Ensure target_df has '소재지전체주소'
     if '소재지전체주소' not in target_df.columns:
-        # If API data lacked it or named differently, ensure mapped before calling this
         pass
 
     target_df['소재지전체주소_norm'] = target_df['소재지전체주소'].astype(str).apply(normalize_address)
-    # Don't dropNA on target immediately, or we lose rows? 
-    # Logic in previous code: target_df = target_df.dropna(subset=['소재지전체주소_norm'])
-    # Yes, we can drop because we can't match without address
     target_df = target_df.dropna(subset=['소재지전체주소_norm'])
 
     # 4. Batch Matching Logic
-    # Prepare Corpus (District)
+    if df_district.empty or target_df.empty:
+        return target_df, [], "District or Target data is empty after normalization."
+
     vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(2, 3)).fit(df_district['full_address_norm'])
     district_matrix = vectorizer.transform(df_district['full_address_norm'])
-    district_originals = df_district['full_address'].tolist()
     
     # Prepare Query (Target)
     target_addrs = target_df['소재지전체주소_norm'].tolist()
+    target_matrix = vectorizer.transform(target_addrs)
     
-    matched_results = []
+    cosine_sim = cosine_similarity(target_matrix, district_matrix)
     
-    if target_addrs:
-        target_matrix = vectorizer.transform(target_addrs)
+    results = []
+    for i in range(len(target_df)):
+        best_match_idx = cosine_sim[i].argmax()
+        best_score = cosine_sim[i][best_match_idx]
         
-        # Chunked Processing
-        chunk_size = 1000
-        num_rows = target_matrix.shape[0]
-        THRESHOLD = 0.5
-        
-        def extract_geo_tokens(addr):
-            if not addr: return set()
-            tokens = addr.split()
-            return set(tokens[:2]) if len(tokens) >= 2 else set(tokens)
-
-        for i in range(0, num_rows, chunk_size):
-            end = min(i + chunk_size, num_rows)
-            chunk_target = target_matrix[i:end]
-            chunk_sim = cosine_similarity(chunk_target, district_matrix)
-            
-            chunk_best_indices = chunk_sim.argmax(axis=1)
-            chunk_best_scores = chunk_sim.max(axis=1)
-            
-            for j, score in enumerate(chunk_best_scores):
-                if score >= THRESHOLD:
-                    candidate = district_originals[chunk_best_indices[j]]
-                    query = target_addrs[i + j]
-                    
-                    q_tok = extract_geo_tokens(query)
-                    c_tok = extract_geo_tokens(candidate)
-                    
-                    # [FIX] Strictly enforce City/Province (First Token) match 
-                    # before allowing token intersection match to prevent
-                    # cross-city matching (e.g. Incheon Jung-gu matching Seoul Jung-gu)
-                    q_city = str(query).split()[0] if query else ""
-                    c_city = str(candidate).split()[0] if candidate else ""
-                    
-                    # City names might be '서울' vs '서울시', so check prefix sharing
-                    city_match = q_city and c_city and (q_city in c_city or c_city in q_city)
-                    
-                    if city_match and q_tok.intersection(c_tok):
-                        matched_results.append(candidate)
-                    else:
-                        matched_results.append(None)
-                else:
-                    matched_results.append(None)
-    
-    target_df['matched_address'] = matched_results
-    
-    # 5. Merge
-    merge_cols = ['full_address', '관리지사', 'SP담당']
-    if '영업구역 수정' in df_district.columns:
-        merge_cols.append('영업구역 수정')
-        
-    final_df = target_df.merge(df_district[merge_cols], left_on='matched_address', right_on='full_address', how='left')
-    
-    # 6. Area Calculation
-    site_area = pd.to_numeric(final_df['소재지면적'], errors='coerce').fillna(0)
-    tot_area = pd.to_numeric(final_df['총면적'], errors='coerce').fillna(0)
-    use_area = np.where(site_area > 0, site_area, tot_area)
-    final_df['평수'] = (use_area / 3.3058).round(1)
-    
-    # 7. Final Cleanup
-    # [FIX] Do not drop unassigned branches (`관리지사` is null or `미지정`). Keep them for Admin review.
-    final_df['관리지사'] = final_df['관리지사'].fillna('미지정')
-    # final_df = final_df.dropna(subset=['관리지사']) # Removed to keep unassigned
-    # final_df = final_df[final_df['관리지사'] != '미지정'] # Removed to keep unassigned
-    
-    final_df['SP담당'] = final_df['SP담당'].fillna('미지정')
-    if '영업구역 수정' in final_df.columns:
-        final_df['영업구역 수정'] = final_df['영업구역 수정'].fillna('')
-        
-    # Extract Manager Info
-    if '영업구역 수정' in df_district.columns:
-        mgr_info = df_district[['SP담당', '영업구역 수정', '관리지사']].drop_duplicates().to_dict(orient='records')
-    else:
-        mgr_info = df_district[['SP담당', '관리지사']].drop_duplicates().to_dict(orient='records')
-
-    # 8. Merge Persistent Activity Status
-    # [FEATURE] Load saved activity status (e.g. Visit) and merge
-    final_df = merge_activity_status(final_df)
-    
-    # 9. [OPTIMIZATION] Calculate Last Modified Date (Vectorized)
-    # Replaces the slow row-by-row apply in app.py
-    # Logic: Max of (In-permission Date, Closed Date, Activity Change Date, Current Time if all null)
-    
-    # Ensure datetime format and timezone consistency (KST) for all possible date columns
-    for col in ['인허가일자', '폐업일자', '변경일시', '최종수정시점']:
-        if col in final_df.columns:
-            # First convert to datetime (ensure it's not a string)
-            converted = pd.to_datetime(final_df[col], errors='coerce')
-            
-            # [FIX] Safer localization logic to avoid 'Already tz-aware' or mixed TZ errors
-            if converted.dt.tz is None:
-                final_df[col] = converted.dt.tz_localize('Asia/Seoul', ambiguous='infer', nonexistent='shift_forward')
-            else:
-                # If already tz-aware, just ensure it's KST
-                final_df[col] = converted.dt.tz_convert('Asia/Seoul')
-            
-    # Candidate columns for "Last Modified"
-    # We prioritize: Activity Change > Closed Date > License Date > Original CSV Date
-    candidate_cols = []
-    
-    if '변경일시' in final_df.columns:
-        candidate_cols.append('변경일시')
-    if '폐업일자' in final_df.columns:
-        candidate_cols.append('폐업일자')
-    if '인허가일자' in final_df.columns:
-        candidate_cols.append('인허가일자')
-    if '최종수정시점' in final_df.columns and '최종수정시점' not in candidate_cols:
-         candidate_cols.append('최종수정시점')
-    
-    # Calculate Max Date
-    if candidate_cols:
-        final_df['최종수정시점'] = final_df[candidate_cols].max(axis=1)
-        
-        # [LOGIC] Only fill with Now if ALL are NaT
-        from src import utils
-        now_kst = utils.get_now_kst()
-        
-        mask_all_nat = final_df['최종수정시점'].isna()
-        final_df.loc[mask_all_nat, '최종수정시점'] = now_kst
-    else:
-        from src import utils
-        final_df['최종수정시점'] = utils.get_now_kst()
-            
-    return final_df, mgr_info, None
-
-def merge_activity_status(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Merges persistent activity status from JSON storage into the DataFrame.
-    Can be called independently to refresh status without reloading all data.
-    """
-    if df is None or df.empty:
-        return df
-
-    try:
-        from src import activity_logger
-        # Load all statuses once
-        saved_statuses = activity_logger.load_json_file(activity_logger.ACTIVITY_STATUS_FILE)
-        
-        if not saved_statuses:
-             if '활동진행상태' not in df.columns:
-                 df['활동진행상태'] = ''
-             return df
-
-        # [OPTIMIZATION] Vectorized Mapping
-        # 1. Ensure 'record_key' exists
-        if 'record_key' not in df.columns:
-            # Fallback generation if not pre-calculated
-            # Use vectorized string operations if possible, or apply as last resort
-            # Since utils.generate_record_key has complex regex/dict replacement, we stick to apply 
-            # but only for the key generation part.
-            df['record_key'] = df.apply(
-                lambda row: utils.generate_record_key(
-                    row.get('사업장명', ''),
-                    row.get('소재지전체주소', '') or row.get('도로명전체주소', '') or row.get('주소', '')
-                ),
-                axis=1
-            )
-        
-        # 2. Prepare Mapping Dictionaries
-        status_map = {}
-        note_map = {}
-        date_map = {}
-        
-        for k, v in saved_statuses.items():
-            if v.get('활동진행상태'):
-                status_map[k] = activity_logger.normalize_status(v.get('활동진행상태'))
-            if v.get('특이사항'):
-                note_map[k] = v.get('특이사항')
-            if v.get('변경일시'):
-                date_map[k] = v.get('변경일시')
-                
-        # 3. Apply Mappings (Vectorized)
-        # Using .map allows O(1) lookup per row compared to python function call overhead
-        if status_map:
-            df['활동진행상태'] = df['record_key'].map(status_map).fillna(df.get('영업상태명', ''))
+        if best_score >= 0.7:
+             results.append({
+                 '관리지사': df_district.iloc[best_match_idx]['관리지사'],
+                 'SP담당': df_district.iloc[best_match_idx]['SP담당']
+             })
         else:
-            if '활동진행상태' not in df.columns:
-                 df['활동진행상태'] = df.get('영업상태명', '')
-
-        if note_map:
-            df['특이사항'] = df['record_key'].map(note_map).fillna('')
-        else:
-            df['특이사항'] = ''
-            
-        if date_map:
-            df['변경일시'] = df['record_key'].map(date_map).fillna('')
-        else:
-            df['변경일시'] = ''
-
-        # NaNs handling
-        df['활동진행상태'] = df['활동진행상태'].fillna('')
-            
-    except Exception as e:
-        print(f"Failed to merge activity status: {e}")
-        if '활동진행상태' not in df.columns:
-             df['활동진행상태'] = ''
+             results.append({'관리지사': '미지정', 'SP담당': '미지정'})
              
-    return df
+    results_df = pd.DataFrame(results, index=target_df.index)
+    target_df = pd.concat([target_df, results_df], axis=1)
+    
+    # Manager stats
+    mgr_info = []
+    for branch in target_df['관리지사'].unique():
+        if branch == '미지정': continue
+        branch_df = target_df[target_df['관리지사'] == branch]
+        for mgr in branch_df['SP담당'].unique():
+            if mgr == '미지정': continue
+            mgr_info.append({'branch': branch, 'name': mgr, 'count': len(branch_df[branch_df['SP담당'] == mgr])})
+            
+    return target_df, mgr_info, None
 
-@st.cache_data(ttl=3600, show_spinner="데이터 처리 중...") # Added TTL and salt implicitly via code change
-def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: Any, dist_mtime: Optional[float] = None, version: str = "v1.1") -> Tuple[Union[pd.DataFrame, None], List[Dict], Optional[str], Dict[str, int]]:
+
+@st.cache_data(show_spinner=False)
+def load_and_process_data(zip_file_path: str, district_file_path_or_obj: Any, salt: str = ""):
     """
-    Loads data from uploads, extracts ZIP, processes CSVs, and merges with district data.
-    Returns: (DataFrame, ManagerInfo, ErrorMessage, StatsDict)
+    Main function to load LocalData (ZIP of CSVs) and merge with District file.
+    Includes robust encoding, headerless support, and coordinate normalization.
     """
-    # 1. Process Zip File
-    # [FIX] Use unique subfolder in system temp directory to prevent collisions and Streamlit watcher loops
-    import tempfile
-    extract_folder = tempfile.mkdtemp(prefix="sales_assist_ext_")
-    
-    # Handle single or multiple inputs
-    zip_inputs = zip_file_path_or_obj if isinstance(zip_file_path_or_obj, list) else [zip_file_path_or_obj]
-    
+    temp_dir = "temp_extracted"
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir)
+
     try:
-        for i, zip_item in enumerate(zip_inputs):
-            # Skip if None
-            if zip_item is None: continue
-            
-            # Create unique subfolder to prevent overwrite
-            # [FIX] Use subfolders for multi-zip mixing
-            sub_zip_folder = os.path.join(extract_folder, f"zip_{i}")
-            os.makedirs(sub_zip_folder, exist_ok=True)
-            
-            with zipfile.ZipFile(zip_item, 'r') as zip_ref:
-                # [FIX] Manually extract each file to handle 'File name too long' issue
-                for member in zip_ref.infolist():
-                    filename = member.filename
-                    # Truncate filename if it's too long (filesystem limit is usually 255)
-                    # We use a safe margin (100) and preserve extension
-                    if len(filename) > 100:
-                        import hashlib
-                        ext = os.path.splitext(filename)[1]
-                        h = hashlib.md5(filename.encode()).hexdigest()[:8]
-                        filename = filename[:80] + "_" + h + ext
-                    
-                    target_path = os.path.join(sub_zip_folder, filename)
-                    # Ensure directories exist
-                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                    
-                    if not member.is_dir():
-                        with zip_ref.open(member) as source, open(target_path, "wb") as target:
-                            shutil.copyfileobj(source, target)
+        zip_tasks = zip_file_path if isinstance(zip_file_path, list) else [zip_file_path]
+        for zip_obj in zip_tasks:
+            with zipfile.ZipFile(zip_obj, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
     except Exception as e:
-        return None, [], f"ZIP extraction failed: {e}", {}
-        
-    all_files = glob.glob(os.path.join(extract_folder, "**/*.csv"), recursive=True)
+        return None, [], f"Error extracting ZIP: {e}", {}
+
+    all_files = glob.glob(os.path.join(temp_dir, "**/*.csv"), recursive=True)
     dfs = []
     
     def generate_vectorized_record_key(df_in):
-        """Vectorized version of utils.generate_record_key for high performance N=134k+"""
+        """Vectorized version of utils.generate_record_key"""
         if df_in is None or df_in.empty: return df_in
-        
-        # 1. Prepare Title and Address series
         t_ser = df_in.get('사업장명', pd.Series(['']*len(df_in), index=df_in.index)).fillna('').astype(str)
         a_ser = (df_in.get('소재지전체주소', pd.Series(['']*len(df_in), index=df_in.index)).fillna('')
                  .combine_first(df_in.get('도로명전체주소', pd.Series(['']*len(df_in), index=df_in.index)).fillna(''))
                  .combine_first(df_in.get('주소', pd.Series(['']*len(df_in), index=df_in.index)).fillna(''))
                  .astype(str))
         
-        # 2. Define Vectorized Clean
         replacements = {
             "서울특별시": "서울", "서울시": "서울", "경기도": "경기", "기도": "경기",
             "인천특별광역시": "인천", "인천광역시": "인천", "인천시": "인천",
@@ -374,107 +170,66 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
         }
         
         def v_clean(ser):
-            # Normalize to NFC
-            # ser = ser.str.normalize('NFC') # Removed to match utils.py behavior (which does it string by string)
-            # Bulk replacements
+            import re
             for k, v in replacements.items():
                 ser = ser.str.replace(k, v, regex=False)
-            # Remove quotes and whitespace cleanup
             ser = ser.str.replace('"', '', regex=False).str.replace("'", "", regex=False).str.replace('\n', '', regex=False)
             ser = ser.str.replace(r'\s+', ' ', regex=True).str.strip()
             return ser
 
-        # 3. Apply Clean and Join
         df_in['record_key'] = v_clean(t_ser) + "_" + v_clean(a_ser)
         return df_in
 
     for file in all_files:
         try:
-            # [FIX] Try multiple encodings for better compatibility (UTF-8 with BOM vs CP949)
-            encodings_to_try = ['utf-8-sig', 'cp949', 'cp949'] # cp949 is fallback
+            encodings_to_try = ['utf-8-sig', 'cp949']
             df = None
-            used_encoding = None
-            
             for enc in encodings_to_try:
                 try:
-                    # Initial check for '주소' in header to confirm correct encoding
                     df_check = pd.read_csv(file, encoding=enc, on_bad_lines='skip', dtype=str, nrows=5)
-                    # Standard detection: has '주소' in some column
                     if any('주소' in str(c) for c in df_check.columns):
                         df = pd.read_csv(file, encoding=enc, on_bad_lines='skip', dtype=str, low_memory=False)
-                        used_encoding = enc
                         break
-                    # Fallback detection: header looks like data (e.g., col 0 is numeric, col 1 is text)
-                    # Many localdata files have 26+ columns. If they are headerless, col 0 is usually an ID or number.
                     elif len(df_check.columns) >= 20: 
-                         # Check if column 0 looks like an ID or data (not a string like '번호')
                          first_val = str(df_check.columns[0])
                          if first_val.isdigit() or first_val.startswith('20'):
-                             # Read without header
                              df = pd.read_csv(file, encoding=enc, on_bad_lines='skip', dtype=str, low_memory=False, header=None)
-                             # Provide standard LocalData mapped names for headerless files
                              num_cols = len(df.columns)
                              # Mapping based on common [26-column] LocalData structure
-                             # 0:번호, 1:개방서비스명, 2:개방자치단체코드, 3:관리번호, 4:인허가일자, 5:인허가취소일자, 
-                             # 6:영업상태구분코드, 7:영업상태명, 8:상세영업상태코드, 9:상세영업상태명... 
-                             # 15:소재지전체주소, 16:도로명전체주소, 19:좌표정보(X), 20:좌표정보(Y)
-                             # [MATCHING BY POSITIONS if headerless]
-                             headerless_map = {
-                                 1: '영업상태명', 3: '관리번호', 4: '인허가일자', 7: '영업상태명', 10: '최종수정시점',
-                                 15: '소재지전체주소', 16: '도로명전체주소', 19: '좌표정보(X)', 20: '좌표정보(Y)', 22: '사업장명'
-                             }
-                             # More robust headerless mapping: Verify content
-                             if num_cols >= 20: 
-                                 # Heuristic: Find columns with large numeric values (Bessel)
-                                 # or values in WGS84 range
-                                 x_idx, y_idx = None, None
-                                 for col_idx in range(min(num_cols, 30)):
-                                     sample_vals = pd.to_numeric(df.iloc[:20, col_idx], errors='coerce').dropna()
-                                     if not sample_vals.empty:
-                                         med = sample_vals.median()
-                                         if 150000 < med < 250000: x_idx = col_idx
-                                         if 400000 < med < 550000: y_idx = col_idx
-                                         if 124 < med < 132: x_idx = col_idx # Lon
-                                         if 33 < med < 43: y_idx = col_idx   # Lat
-                                 
-                                 # Standard fallback if heuristic failed
-                                 if x_idx is None: x_idx = 4 if num_cols > 4 else None
-                                 if y_idx is None: y_idx = 5 if num_cols > 5 else None
-                                 
-                                 rename_map_h = {}
-                                 if x_idx is not None: rename_map_h[x_idx] = '좌표정보(X)'
-                                 if y_idx is not None: rename_map_h[y_idx] = '좌표정보(Y)'
-                                 
-                                 # Address is usually around index 15 in standard LocalData
-                                 for a_idx in [15, 16, 17, 18, 14]:
-                                     if a_idx < num_cols:
-                                         sample_a = str(df.iloc[0, a_idx])
-                                         if '시' in sample_a or '도' in sample_a:
-                                             rename_map_h[a_idx] = '소재지전체주소'
-                                             break
-                                             
-                                 if rename_map_h:
-                                     df.rename(columns=rename_map_h, inplace=True)
-                             used_encoding = enc
+                             x_idx, y_idx = None, None
+                             for col_idx in range(min(num_cols, 30)):
+                                 sample_vals = pd.to_numeric(df.iloc[:20, col_idx], errors='coerce').dropna()
+                                 if not sample_vals.empty:
+                                     med = sample_vals.median()
+                                     if 150000 < med < 350000: x_idx = col_idx
+                                     if 400000 < med < 650000: y_idx = col_idx
+                                     if 124 < med < 132: x_idx = col_idx 
+                                     if 33 < med < 43: y_idx = col_idx   
+                             
+                             h_map = {}
+                             if x_idx is not None: h_map[x_idx] = '좌표정보(X)'
+                             if y_idx is not None: h_map[y_idx] = '좌표정보(Y)'
+                             # Address heuristic
+                             for a_idx in [15, 16, 17, 18, 14]:
+                                 if a_idx < num_cols:
+                                     sample_a = str(df.iloc[0, a_idx])
+                                     if '시' in sample_a or '도' in sample_a:
+                                         h_map[a_idx] = '소재지전체주소'
+                                         break
+                             if h_map: df.rename(columns=h_map, inplace=True)
                              break
                 except Exception:
                     continue
             
-            if df is None or df.empty:
-                continue
-                
-            # Filter standard headers
-            # [OPTIMIZATION] Smart Filter for 2026 onwards
+            if df is None or df.empty: continue
+            
+            df_filtered = df.copy()
             if '인허가일자' in df.columns:
-                # Find status column to differentiate active vs closed
                 status_cols = [c for c in df.columns if '상태명' in c]
-                
                 if status_cols:
                     status_col = status_cols[0]
-                    # 영업/정상은 2026년 이후만, 폐업 등은 전체 포함
                     raw_dates = df['인허가일자'].fillna('').astype(str).str.replace(r'[^0-9]', '', regex=True)
                     df['parsed_temp_year'] = pd.to_numeric(raw_dates.str[:4], errors='coerce').fillna(0).astype(int)
-                    
                     is_active = df[status_col].str.contains('영업|정상', na=False)
                     is_valid_date = df['parsed_temp_year'] >= 2026
                     
@@ -487,18 +242,32 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
                     
                     mask_active = is_active & is_valid_date
                     mask_closed = ~is_active & is_valid_close_date
-                    
                     df_filtered = df[mask_active | mask_closed].copy()
-                    df_filtered.drop(columns=['parsed_temp_year'], inplace=True)
+                    if 'parsed_temp_year' in df_filtered.columns: df_filtered.drop(columns=['parsed_temp_year'], inplace=True)
                 else:
                     raw_dates = df['인허가일자'].fillna('').astype(str).str.replace(r'[^0-9]', '', regex=True)
                     temp_years = pd.to_numeric(raw_dates.str[:4], errors='coerce').fillna(0).astype(int)
                     df_filtered = df[temp_years >= 2026].copy()
-            else:
-                df_filtered = df.copy()
-                
+
             if not df_filtered.empty:
-                # [OPTIMIZATION] Early Deduplication per File using vectorized key
+                # [FIX] Per-file Coordinate Normalization
+                all_f_cols = df_filtered.columns
+                x_c = next((c for c in all_f_cols if '좌표' in c and ('x' in c.lower() or 'X' in c)), None)
+                if not x_c: x_c = next((c for c in all_f_cols if 'epsg' in c.lower() and 'x' in c.lower()), None)
+                y_c = next((c for c in all_f_cols if '좌표' in c and ('y' in c.lower() or 'Y' in c)), None)
+                if not y_c: y_c = next((c for c in all_f_cols if 'epsg' in c.lower() and 'y' in c.lower()), None)
+                
+                rename_f = {}
+                if x_c: rename_f[x_c] = '좌표정보(X)'
+                if y_c: rename_f[y_c] = '좌표정보(Y)'
+                
+                # Check for address normalization
+                addr_c = next((c for c in all_f_cols if c in ['소재지전체주소', '도로명전체주소', '주소']), None)
+                if not addr_c: addr_c = next((c for c in all_f_cols if '주소' in c and '전체' in c), None)
+                if addr_c: rename_f[addr_c] = '소재지전체주소'
+                
+                if rename_f: df_filtered.rename(columns=rename_f, inplace=True)
+
                 df_filtered = generate_vectorized_record_key(df_filtered)
                 if '인허가일자' in df_filtered.columns:
                     df_filtered['인허가일자_dt'] = pd.to_datetime(df_filtered['인허가일자'], errors='coerce')
@@ -510,34 +279,21 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
         except Exception:
             continue
             
-    if not dfs:
-        return None, [], "No valid CSV files found in ZIP.", {}
+    if not dfs: return None, [], "No valid CSV files found.", {}
         
     concatenated_df = pd.concat(dfs, ignore_index=True)
-    
-    # [STATS] Before Global Mix Count
     count_before = len(concatenated_df)
     
-    # [GLOBAL DEDUPLICATION] Final pass
     if '인허가일자' in concatenated_df.columns:
         concatenated_df['인허가일자_dt'] = pd.to_datetime(concatenated_df['인허가일자'], errors='coerce')
         concatenated_df.sort_values(by='인허가일자_dt', ascending=False, inplace=True, na_position='last')
         concatenated_df.drop(columns=['인허가일자_dt'], inplace=True)
 
-    # Remove duplicates based on record_key
     concatenated_df.drop_duplicates(subset=['record_key'], keep='first', inplace=True)
-    
-    # [STATS] After Mix Count
     count_after = len(concatenated_df)
-    
-    # st.toast and st.info removed to fix CacheReplayClosureError
     stats = {'before': count_before, 'after': count_after}
 
-    # Dynamic Column Mapping
     all_cols = concatenated_df.columns
-    x_col = next((c for c in all_cols if '좌표' in c and ('x' in c.lower() or 'X' in c)), None)
-    y_col = next((c for c in all_cols if '좌표' in c and ('y' in c.lower() or 'Y' in c)), None)
-    
     desired_patterns = ['소재지전체주소', '지번주소', '사업장명', '업태구분명', '영업상태명', 
                         '소재지전화', '소재지전화번호', '총면적', '소재지면적', '인허가일자', '폐업일자', 
                         '재개업일자', '최종수정시점', '데이터기준일자']
@@ -545,138 +301,72 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
     rename_map = {}
     selected_cols = []
     
-    # [FIX] Exact match for Road Name Address to prevent grabbing '실험실도로명주소시군구코드'
-    road_col_found = None
+    if '좌표정보(X)' in all_cols: selected_cols.append('좌표정보(X)')
+    if '좌표정보(Y)' in all_cols: selected_cols.append('좌표정보(Y)')
+    
     for cand in ['도로명전체주소', '도로명주소', '소재지도로명주소']:
         if cand in all_cols:
-            road_col_found = cand
             selected_cols.append(cand)
-            rename_map[cand] = '도로명전체주소' # Standardize internally to 도로명전체주소
+            rename_map[cand] = '도로명전체주소'
             break
             
     for pat in desired_patterns:
-        # [FIX] Prioritize Exact Match to prevent '상세영업상태명' matching '영업상태명'
-        if pat in all_cols:
-            match = pat
-        else:
-            match = next((c for c in all_cols if pat in c), None)
-            
+        match = pat if pat in all_cols else next((c for c in all_cols if pat in c), None)
         if match:
-            selected_cols.append(match)
+            if match not in selected_cols: selected_cols.append(match)
             rename_map[match] = pat
             
-    # [FIX] Robust Coordinate Mapping: Try common variations
-    coord_x_pats = ['좌표정보(X)', '좌표정보x', '좌표x', 'x좌표']
-    coord_y_pats = ['좌표정보(Y)', '좌표정보y', '좌표y', 'y좌표']
-    
-    if not x_col:
-        x_col = next((c for c in all_cols if any(p in c.lower() for p in coord_x_pats)), None)
-    if not y_col:
-        y_col = next((c for c in all_cols if any(p in c.lower() for p in coord_y_pats)), None)
-
-    if x_col: 
-        selected_cols.append(x_col)
-        if x_col not in rename_map: rename_map[x_col] = '좌표정보(X)'
-    if y_col: 
-        selected_cols.append(y_col)
-        if y_col not in rename_map: rename_map[y_col] = '좌표정보(Y)'
-    
-    # [OPTIMIZATION] Include record_key
     selected_cols.append('record_key')
-    
     target_df = concatenated_df[list(set(selected_cols))].copy()
     target_df.rename(columns=rename_map, inplace=True)
     
-    # [FIX] Address Standardization
-    # Prioritize '소재지전체주소' then '지번주소' then '도로명전체주소'
     if '소재지전체주소' not in target_df.columns:
-        if '지번주소' in target_df.columns:
-            target_df.rename(columns={'지번주소': '소재지전체주소'}, inplace=True)
-        elif '도로명전체주소' in target_df.columns:
-            target_df['소재지전체주소'] = target_df['도로명전체주소']
-        elif '도로명주소' in target_df.columns:
-            target_df['소재지전체주소'] = target_df['도로명주소']
-        elif '주소' in target_df.columns:
-             target_df['소재지전체주소'] = target_df['주소']
+        if '지번주소' in target_df.columns: target_df.rename(columns={'지번주소': '소재지전체주소'}, inplace=True)
+        elif '도로명전체주소' in target_df.columns: target_df['소재지전체주소'] = target_df['도로명전체주소']
+        elif '주소' in target_df.columns: target_df['소재지전체주소'] = target_df['주소']
     
-    # [FIX] Phone Standardization
     if '소재지전화' not in target_df.columns and '소재지전화번호' in target_df.columns:
         target_df.rename(columns={'소재지전화번호': '소재지전화'}, inplace=True)
 
-    # [NEW] Normalize Status Values for app.py strict checks
     if '영업상태명' in target_df.columns:
-        # Standardize: Map various 'Active' strings to '영업/정상' and 'Closed' to '폐업'
         target_df['영업상태명'] = target_df['영업상태명'].fillna('').astype(str).str.strip()
-        
-        # [FIX] Unicode normalization (NFC) for consistency
-        import unicodedata
         target_df['영업상태명'] = target_df['영업상태명'].apply(lambda x: unicodedata.normalize('NFC', x))
-        
-        active_patterns = ['영업/정상', '정상영업', '개업', '영업', '정상', '01']
-        closed_patterns = ['폐업', '폐업처리', '03']
-        
-        # Normalize to NFC for comparison
-        active_patterns = [unicodedata.normalize('NFC', p) for p in active_patterns]
-        closed_patterns = [unicodedata.normalize('NFC', p) for p in closed_patterns]
-        
-        target_df.loc[target_df['영업상태명'].isin(active_patterns), '영업상태명'] = '영업/정상'
-        target_df.loc[target_df['영업상태명'].isin(closed_patterns), '영업상태명'] = '폐업'
+        active_p = [unicodedata.normalize('NFC', p) for p in ['영업/정상', '정상영업', '개업', '영업', '정상', '01']]
+        closed_p = [unicodedata.normalize('NFC', p) for p in ['폐업', '폐업처리', '03']]
+        target_df.loc[target_df['영업상태명'].isin(active_p), '영업상태명'] = '영업/정상'
+        target_df.loc[target_df['영업상태명'].isin(closed_p), '영업상태명'] = '폐업'
 
-    # Date Parsing
     date_cols = ['인허가일자', '폐업일자', '재개업일자']
     for col in date_cols:
-        if col in target_df.columns:
-            target_df[col] = pd.to_datetime(target_df[col], errors='coerce')
+        if col in target_df.columns: target_df[col] = pd.to_datetime(target_df[col], errors='coerce')
             
-    # [FIX] Compute '최종수정시점' for accurate Period Filtering in app.py
-    # Takes the maximum valid date among Permit, Closure, and Re-open dates.
-    available_dates = [c for c in date_cols if c in target_df.columns]
-    if available_dates:
-        target_df['최종수정시점'] = target_df[available_dates].max(axis=1)
+    avail_dates = [c for c in date_cols if c in target_df.columns]
+    if avail_dates: target_df['최종수정시점'] = target_df[avail_dates].max(axis=1)
     
-    if '인허가일자' in target_df.columns:
-        target_df.sort_values(by='인허가일자', ascending=False, inplace=True)
+    if '인허가일자' in target_df.columns: target_df.sort_values(by='인허가일자', ascending=False, inplace=True)
         
-    # Coordinate Parsing
-    if x_col and y_col:
-        # [FIX] Since we renamed them above, they should now be '좌표정보(X)' and '좌표정보(Y)'
-        x_c = '좌표정보(X)' if '좌표정보(X)' in target_df.columns else x_col
-        y_c = '좌표정보(Y)' if '좌표정보(Y)' in target_df.columns else y_col
-        
-        xs = pd.to_numeric(target_df[x_c], errors='coerce').values
-        ys = pd.to_numeric(target_df[y_c], errors='coerce').values
-        
-        lats = np.full(xs.shape, np.nan)
-        lons = np.full(ys.shape, np.nan)
-        valid_mask = ~np.isnan(xs) & ~np.isnan(ys)
-        
-        if np.any(valid_mask):
-             sample_x = xs[valid_mask]
-             if np.median(sample_x) > 200 and HAS_PYPROJ:
+    if '좌표정보(X)' in target_df.columns and '좌표정보(Y)' in target_df.columns:
+        xs = pd.to_numeric(target_df['좌표정보(X)'], errors='coerce').values
+        ys = pd.to_numeric(target_df['좌표정보(Y)'], errors='coerce').values
+        lats, lons = np.full(xs.shape, np.nan), np.full(xs.shape, np.nan)
+        valid = ~np.isnan(xs) & ~np.isnan(ys)
+        if np.any(valid):
+             if np.median(xs[valid]) > 200 and HAS_PYPROJ:
                  try:
-                     lon_v, lat_v = transformer.transform(xs[valid_mask], ys[valid_mask])
-                     lats[valid_mask] = lat_v
-                     lons[valid_mask] = lon_v
+                     lon_v, lat_v = transformer.transform(xs[valid], ys[valid])
+                     lats[valid], lons[valid] = lat_v, lon_v
                  except Exception as e:
-                     # For diagnostics
                      if 'diagnostic_errors' not in target_df.attrs: target_df.attrs['diagnostic_errors'] = []
                      target_df.attrs['diagnostic_errors'].append(f"Transform error: {e}")
              else:
-                 lats = ys
-                 lons = xs
+                 lats[valid], lons[valid] = ys[valid], xs[valid]
         
-        # Bound Check
-        bad_mask = (lats < 30) | (lats > 45) | (lons < 120) | (lons > 140)
-        lats[bad_mask] = np.nan
-        lons[bad_mask] = np.nan
-        
-        target_df['lat'] = lats
-        target_df['lon'] = lons
+        bad = (lats < 30) | (lats > 45) | (lons < 120) | (lons > 140)
+        lats[bad], lons[bad] = np.nan, np.nan
+        target_df['lat'], target_df['lon'] = lats, lons
     else:
-        target_df['lat'] = None
-        target_df['lon'] = None
+        target_df['lat'], target_df['lon'] = None, None
         
-    # Delegate to common processor
     final_df, mgr_info, err = _process_and_merge_district_data(target_df, district_file_path_or_obj)
     return final_df, mgr_info, err, stats
 
@@ -695,34 +385,22 @@ def fetch_openapi_data(auth_key: str, local_code: str, start_date: str, end_date
         "numOfRows": 1000, 
         "pageNo": 1
     }
-    
     all_rows = []
     try:
         response = requests.get(base_url, params=params, timeout=20)
-        if response.status_code != 200:
-            return None, f"API Error: Status {response.status_code}"
-            
+        if response.status_code != 200: return None, f"API Error: Status {response.status_code}"
         root = ET.fromstring(response.content)
         header = root.find("header")
         if header is not None:
              code = header.find("resultCode")
              msg = header.find("resultMsg")
-             if code is not None and code.text != '00':
-                 return None, f"API Logic Error: {msg.text if msg is not None else 'Unknown'}"
+             if code is not None and code.text != '00': return None, f"API Logic Error: {msg.text if msg is not None else 'Unknown'}"
                  
         body = root.find("body")
         items = body.find("items") if body is not None else root.findall("row")
-        if items is None or len(items) == 0:
-            items = root.findall("row")
-            
-        if not items:
-            # Try finding direct in root if xml structure is flat
-            items = root.findall("row")
-            
-        if not items and hasattr(items, 'findall'):
-             # If items is an Element (from body.find('items'))
-             items = items.findall("item")
-
+        if items is None or len(items) == 0: items = root.findall("row")
+        if not items: items = root.findall("row")
+        if not items and hasattr(items, 'findall'): items = items.findall("item")
         if not items: return None, "No specific data found."
 
         def get_val(item, tags):
@@ -753,74 +431,47 @@ def fetch_openapi_data(auth_key: str, local_code: str, start_date: str, end_date
             row_data['소재지면적'] = get_val(item, ["siteArea", "SITE_AREA"])
             row_data['총면적'] = get_val(item, ["totArea", "TOT_AREA"])
             all_rows.append(row_data)
-            
-    except Exception as e:
-        return None, f"Fetch Exception: {e}"
-        
+    except Exception as e: return None, f"Fetch Exception: {e}"
     if not all_rows: return None, "Parsed 0 rows."
     return pd.DataFrame(all_rows), None
+
 
 @st.cache_data
 def process_api_data(target_df: pd.DataFrame, district_file_path_or_obj: Any) -> Tuple[Union[pd.DataFrame, None], List[Dict], Optional[str], Dict[str, int]]:
     """
     Processes API data and merges with district.
     """
-    if target_df is None or target_df.empty:
-        return None, [], "API DataFrame is empty.", {}
-        
-    x_col = '좌표정보(X)'
-    y_col = '좌표정보(Y)'
-    
-    # Coordinate parsing
+    if target_df is None or target_df.empty: return None, [], "API DataFrame is empty.", {}
+    x_col, y_col = '좌표정보(X)', '좌표정보(Y)'
     if x_col in target_df.columns and y_col in target_df.columns:
-         # Check if we need to call parse_coordinates_row.
-         # But in `load_and_process`, we did vectorized. Let's do vectorized here too if possible?
-         # `parse_coordinates_row` handles the logic row-by-row safely.
-         # For consistency with previous API logic, let's keep it or improve.
-         # Improve: use vectorized if possible, but row-by-row is safer for mixed API data.
          target_df['lat'], target_df['lon'] = zip(*target_df.apply(lambda row: parse_coordinates_row(row, x_col, y_col), axis=1))
     else:
-         target_df['lat'] = None
-         target_df['lon'] = None
-         
+         target_df['lat'], target_df['lon'] = None, None
     for col in ['인허가일자', '폐업일자', '휴업시작일자', '휴업종료일자', '재개업일자']:
-        if col in target_df.columns:
-            target_df[col] = pd.to_datetime(target_df[col], format='%Y%m%d', errors='coerce')
-            
-    if '인허가일자' in target_df.columns:
-        target_df.sort_values(by='인허가일자', ascending=False, inplace=True)
-
-    # [OPTIMIZATION] Generate record_key for API data
+        if col in target_df.columns: target_df[col] = pd.to_datetime(target_df[col], format='%Y%m%d', errors='coerce')
+    if '인허가일자' in target_df.columns: target_df.sort_values(by='인허가일자', ascending=False, inplace=True)
     if 'record_key' not in target_df.columns:
         from . import utils
+        addr_cols = ['소재지전체주소', '도로명전체주소', '주소']
         target_df['record_key'] = target_df.apply(
             lambda row: utils.generate_record_key(
                 row.get('사업장명', ''),
-                row.get('소재지전체주소', '') or row.get('도로명전체주소', '') or row.get('주소', '')
-            ),
-            axis=1
+                next((row.get(c) for c in addr_cols if row.get(c)), '')
+            ), axis=1
         )
-
-    # Delegate to common processor
     final_df, mgr_info, err = _process_and_merge_district_data(target_df, district_file_path_or_obj)
-    # API data usually comes pre-filtered/limited, so simple stats
     stats = {'before': len(target_df) if target_df is not None else 0, 'after': len(final_df) if final_df is not None else 0}
     return final_df, mgr_info, err, stats
-
-
 
 def load_fixed_coordinates_data(file_path: str):
     """
     [NEW] Fast-path to load fixed coordinate data from Excel.
-    Used for 'Suspended' facilities view.
     """
     try:
         import unicodedata
         import numpy as np
         from . import utils
         df = pd.read_excel(file_path)
-        
-        # 1. Map Columns with Robust Normalization
         target_map = {
             '사업장명': ['상호', '사업장명', '상호명'],
             '소재지전체주소': ['설치주소', '소재지전체주소', '주소'],
@@ -831,10 +482,7 @@ def load_fixed_coordinates_data(file_path: str):
             '영업상태명': ['계약상태(중)', '영업상태명', '상태'],
             '정지상태': ['정지..', '정지상태']
         }
-        
-        # Normalize existing columns to NFC for matching
         norm_cols = {unicodedata.normalize('NFC', c).strip(): c for c in df.columns}
-        
         final_rename = {}
         for target, aliases in target_map.items():
             for alias in aliases:
@@ -842,44 +490,60 @@ def load_fixed_coordinates_data(file_path: str):
                 if norm_alias in norm_cols:
                     final_rename[norm_cols[norm_alias]] = target
                     break
-        
         df.rename(columns=final_rename, inplace=True)
-        
-        # 2. Ensure Coordinates are numeric with robust cleaning
-        # 2. Ensure Coordinates are numeric with robust cleaning
         def clean_lat(x):
             if pd.isna(x) or x is None: return np.nan
             try:
                 v = float(str(x).replace(',', '.'))
                 return v if (33 < v < 43) else np.nan
             except: return np.nan
-
         def clean_lon(x):
             if pd.isna(x) or x is None: return np.nan
             try:
                 v = float(str(x).replace(',', '.'))
                 return v if (124 < v < 132) else np.nan
             except: return np.nan
-            
         if 'lat' in df.columns: df['lat'] = df['lat'].apply(clean_lat)
         if 'lon' in df.columns: df['lon'] = df['lon'].apply(clean_lon)
-        
-        # 3. Generate record_key
-        df['record_key'] = df.apply(
-            lambda row: utils.generate_record_key(
-                str(row.get('사업장명', '')),
-                str(row.get('소재지전체주소', '') or '')
-            ),
-            axis=1
-        )
-        
-        # 4. Fill missing defaults
-        expected_cols = ['사업장명', '소재지전체주소', 'lat', 'lon', '관리지사', 'SP담당', 
-                         '영업상태명', '정지상태', '업태구분명', '소재지전화', '인허가일자', '폐업일자', '소재지면적']
+        df['record_key'] = df.apply(lambda row: utils.generate_record_key(str(row.get('사업장명', '')), str(row.get('소재지전체주소', '') or '')), axis=1)
+        expected_cols = ['사업장명', '소재지전체주소', 'lat', 'lon', '관리지사', 'SP담당', '영업상태명', '정지상태', '업태구분명', '소재지전화', '인허가일자', '폐업일자', '소재지면적']
         for c in expected_cols:
-            if c not in df.columns:
-                df[c] = "-"
-        
+            if c not in df.columns: df[c] = "-"
         return df, {}, "", {}
-    except Exception as e:
-        return None, {}, f"Fixed load error: {e}", {}
+    except Exception as e: return None, {}, f"Fixed load error: {e}", {}
+
+def merge_activity_status(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    [RESTORED] Merges persistent activity status from JSON into the current DataFrame.
+    """
+    from src.activity_logger import ACTIVITY_STATUS_FILE, load_json_file
+    
+    if df is None or df.empty:
+        return df
+        
+    statuses = load_json_file(ACTIVITY_STATUS_FILE)
+    if not statuses:
+        return df
+        
+    rows = []
+    for k, v in statuses.items():
+        if not isinstance(v, dict): continue
+        row = {"record_key": k}
+        row.update(v)
+        rows.append(row)
+    
+    status_df = pd.DataFrame(rows)
+    if status_df.empty:
+        return df
+        
+    if 'record_key' not in df.columns:
+        return df
+        
+    cols_to_overwrite = ['활동진행상태', '특이사항', '변경일시', '변경자', 'photo_path1', 'photo_path2', 'photo_path3']
+    df = df.drop(columns=[c for c in cols_to_overwrite if c in df.columns])
+    
+    # Ensure status_df has only relevant columns for merge
+    merge_cols = ['record_key'] + [c for c in cols_to_overwrite if c in status_df.columns]
+    merged_df = pd.merge(df, status_df[merge_cols], on='record_key', how='left')
+    
+    return merged_df
