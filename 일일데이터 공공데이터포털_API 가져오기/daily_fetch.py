@@ -105,7 +105,7 @@ def main():
         excel_files = list(ETC_PATH.glob("LOCALDATA*지방행정인허가*.xlsx"))
         MAPPING_FILE = excel_files[0] if excel_files else ETC_PATH / 'LOCALDATA_공공데이터포털 지방행정인허가 칼럼 매핑 자료_v3 (2).xlsx'
 
-        TARGET_REGIONS = ["서울특별시", "경기도", "강원도", "강원특별자치도"]
+        TARGET_REGIONS = ["서울특별시", "경기도", "강원도", "강원특별자치도", "인천광역시", "인천"]
 
         # ------------------------------------------
         # 기초 자료 로드 (공통)
