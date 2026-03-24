@@ -390,13 +390,25 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
 
     for file in all_files:
         try:
-            # Check header
-            df_iter = pd.read_csv(file, encoding='cp949', on_bad_lines='skip', dtype=str, chunksize=1000)
-            header = next(df_iter)
-            if not any('주소' in c for c in header.columns): continue
-                
-            df = pd.read_csv(file, encoding='cp949', on_bad_lines='skip', dtype=str, low_memory=False)
+            # [FIX] Try multiple encodings for better compatibility (UTF-8 with BOM vs CP949)
+            encodings_to_try = ['utf-8-sig', 'cp949', 'cp949'] # cp949 is fallback
+            df = None
+            used_encoding = None
             
+            for enc in encodings_to_try:
+                try:
+                    # Initial check for '주소' in header to confirm correct encoding
+                    df_check = pd.read_csv(file, encoding=enc, on_bad_lines='skip', dtype=str, nrows=5)
+                    if any('주소' in str(c) for c in df_check.columns):
+                        df = pd.read_csv(file, encoding=enc, on_bad_lines='skip', dtype=str, low_memory=False)
+                        used_encoding = enc
+                        break
+                except Exception:
+                    continue
+            
+            if df is None or df.empty:
+                continue
+                
             # Filter standard headers
             # [OPTIMIZATION] Smart Filter for 2026 onwards
             if '인허가일자' in df.columns:
@@ -499,8 +511,19 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
             selected_cols.append(match)
             rename_map[match] = pat
             
-    if x_col: selected_cols.append(x_col)
-    if y_col: selected_cols.append(y_col)
+    # [FIX] Robust Coordinate Mapping for epsg5174 suffixes
+    if not x_col:
+        x_col = next((c for c in all_cols if '좌표' in c and ('x' in c.lower() or 'X' in c)), None)
+    if not y_col:
+        y_col = next((c for c in all_cols if '좌표' in c and ('y' in c.lower() or 'Y' in c)), None)
+
+    if x_col: 
+        selected_cols.append(x_col)
+        # Ensure it's not already in rename_map
+        if x_col not in rename_map: rename_map[x_col] = '좌표정보(X)'
+    if y_col: 
+        selected_cols.append(y_col)
+        if y_col not in rename_map: rename_map[y_col] = '좌표정보(Y)'
     
     # [OPTIMIZATION] Include record_key
     selected_cols.append('record_key')
@@ -554,8 +577,9 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
         
     # Coordinate Parsing
     if x_col and y_col:
-        x_c = x_col if x_col in target_df.columns else next((k for k,v in rename_map.items() if v == '좌표정보(X)'), x_col)
-        y_c = y_col if y_col in target_df.columns else next((k for k,v in rename_map.items() if v == '좌표정보(Y)'), y_col)
+        # [FIX] Since we renamed them above, they should now be '좌표정보(X)' and '좌표정보(Y)'
+        x_c = '좌표정보(X)' if '좌표정보(X)' in target_df.columns else x_col
+        y_c = '좌표정보(Y)' if '좌표정보(Y)' in target_df.columns else y_col
         
         xs = pd.to_numeric(target_df[x_c], errors='coerce').values
         ys = pd.to_numeric(target_df[y_c], errors='coerce').values
