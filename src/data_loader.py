@@ -399,10 +399,40 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
                 try:
                     # Initial check for '주소' in header to confirm correct encoding
                     df_check = pd.read_csv(file, encoding=enc, on_bad_lines='skip', dtype=str, nrows=5)
+                    # Standard detection: has '주소' in some column
                     if any('주소' in str(c) for c in df_check.columns):
                         df = pd.read_csv(file, encoding=enc, on_bad_lines='skip', dtype=str, low_memory=False)
                         used_encoding = enc
                         break
+                    # Fallback detection: header looks like data (e.g., col 0 is numeric, col 1 is text)
+                    # Many localdata files have 26+ columns. If they are headerless, col 0 is usually an ID or number.
+                    elif len(df_check.columns) >= 20: 
+                         # Check if column 0 looks like an ID or data (not a string like '번호')
+                         first_val = str(df_check.columns[0])
+                         if first_val.isdigit() or first_val.startswith('20'):
+                             # Read without header
+                             df = pd.read_csv(file, encoding=enc, on_bad_lines='skip', dtype=str, low_memory=False, header=None)
+                             # Provide standard LocalData mapped names for headerless files
+                             num_cols = len(df.columns)
+                             # Mapping based on common [26-column] LocalData structure
+                             # 0:번호, 1:개방서비스명, 2:개방자치단체코드, 3:관리번호, 4:인허가일자, 5:인허가취소일자, 
+                             # 6:영업상태구분코드, 7:영업상태명, 8:상세영업상태코드, 9:상세영업상태명... 
+                             # 15:소재지전체주소, 16:도로명전체주소, 19:좌표정보(X), 20:좌표정보(Y)
+                             # [MATCHING BY POSITIONS if headerless]
+                             headerless_map = {
+                                 1: '영업상태명', 3: '관리번호', 4: '인허가일자', 7: '영업상태명', 10: '최종수정시점',
+                                 15: '소재지전체주소', 16: '도로명전체주소', 19: '좌표정보(X)', 20: '좌표정보(Y)', 22: '사업장명'
+                             }
+                             # More robust headerless mapping for this specific format seen in head:
+                             # 0:자산(?), 1:상호/상태(?), 2:날짜, 3:자산(?), 4:190106(X), 5:441792(Y), 15:주소
+                             if num_cols >= 26:
+                                 # My head-sample had: 0:ID, 1:NAME, 2:DATE, 3:ID, 4:X, 5:Y, 15:ADDR
+                                 # Standard LocalData: X is usually col 26 (idx 25?), ADDR is idx 15
+                                 # We'll assign names based on content analysis if index is hard to predict
+                                 # OR just search for numeric-ish columns in range 150k-500k
+                                 df.rename(columns={1: '사업장명', 4: '좌표정보(X)', 5: '좌표정보(Y)', 15: '소재지전체주소', 2: '인허가일자'}, inplace=True)
+                             used_encoding = enc
+                             break
                 except Exception:
                     continue
             
@@ -603,7 +633,10 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
                      lon_v, lat_v = transformer.transform(xs[valid_mask], ys[valid_mask])
                      lats[valid_mask] = lat_v
                      lons[valid_mask] = lon_v
-                 except: pass
+                 except Exception as e:
+                     # For diagnostics
+                     if 'diagnostic_errors' not in target_df.attrs: target_df.attrs['diagnostic_errors'] = []
+                     target_df.attrs['diagnostic_errors'].append(f"Transform error: {e}")
              else:
                  lats = ys
                  lons = xs

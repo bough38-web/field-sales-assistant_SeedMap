@@ -4141,11 +4141,39 @@ if raw_df is not None:
                 
                 if has_lat and has_lon:
                     st.success("✅ 'lat', 'lon' 좌표 컬럼이 확인되었습니다.")
-                    valid_coords_count = len(map_df.dropna(subset=['lat', 'lon']))
-                    st.write(f"📍 **유효한 좌표 보유**: {valid_coords_count:,}건 / {len(map_df):,}건")
+                    valid_coords_count = len(map_df_base.dropna(subset=['lat', 'lon']))
+                    st.write(f"📍 **유효한 좌표 보유 (전체)**: {valid_coords_count:,}건")
                     
-                    if valid_coords_count == 0 and len(map_df) > 0:
-                        st.error("❌ 컬럼은 존재하나 모든 좌표값이 비어(NaN) 있습니다. '데이터 새로고침'이 필요할 수 있습니다.")
+                    # [DEBUG] Show Coordinate Library Status
+                    from src.utils import HAS_PYPROJ
+                    if HAS_PYPROJ:
+                        st.info("🌐 좌표 변환 라이브러리(pyproj)가 정상 작동 중입니다.")
+                    else:
+                        st.warning("⚠️ 좌표 변환 라이브러리(pyproj)를 찾을 수 없습니다. 원본 좌표가 위경도가 아닐 경우 표시되지 않습니다.")
+                    
+                    if not map_df.empty:
+                        valid_filtered_count = len(map_df.dropna(subset=['lat', 'lon']))
+                        st.write(f"🎯 **현재 필터링된 유효 좌표**: {valid_filtered_count:,}건 / {len(map_df):,}건")
+                    
+                    if valid_coords_count == 0 and len(map_df_base) > 0:
+                        st.error("❌ 데이터에 위경도 값이 모두 비어있습니다. '좌표정보(X/Y)' 컬럼 값을 확인해야 합니다.")
+                        
+                        # Show captured errors from data_loader
+                        if hasattr(map_df_base, 'attrs') and 'diagnostic_errors' in map_df_base.attrs:
+                            st.write("📂 **작업 중 발생한 오류**:")
+                            for err in map_df_base.attrs['diagnostic_errors']:
+                                st.code(err)
+                        
+                        # Show raw coordinate samples
+                        raw_x = [c for c in cols if '좌표' in c and 'X' in c]
+                        raw_y = [c for c in cols if '좌표' in c and 'Y' in c]
+                        if raw_x and raw_y:
+                            try:
+                                sample_x = map_df_base[raw_x[0]].dropna().iloc[0]
+                                sample_y = map_df_base[raw_y[0]].dropna().iloc[0]
+                                st.write(f"📊 **원본 좌표 샘플**: X={sample_x}, Y={sample_y}")
+                            except:
+                                st.write("📊 원본 좌표 컬럼은 있으나 샘플 데이터를 추출할 수 없습니다.")
                 else:
                     st.error("❌ 'lat' 또는 'lon' 컬럼이 누락되었습니다. 데이터 로딩 로직을 점검해야 합니다.")
                 
