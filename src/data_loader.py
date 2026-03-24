@@ -140,7 +140,29 @@ def load_and_process_data(zip_file_path: str, district_file_path_or_obj: Any, sa
         zip_tasks = zip_file_path if isinstance(zip_file_path, list) else [zip_file_path]
         for zip_obj in zip_tasks:
             with zipfile.ZipFile(zip_obj, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
+                for member in zip_ref.infolist():
+                    if member.is_dir():
+                        continue
+                    
+                    filename = os.path.basename(member.filename)
+                    if not filename.lower().endswith('.csv'):
+                        continue
+                        
+                    # [FIX] Truncate extremely long filenames to avoid OS limits (Errno 36)
+                    # Use a max base length of 60 chars + .csv extension
+                    base_name, ext = os.path.splitext(filename)
+                    if len(base_name) > 60:
+                        import hashlib
+                        h = hashlib.md5(base_name.encode()).hexdigest()[:8]
+                        base_name = base_name[:50] + "_" + h
+                    
+                    target_name = base_name + ext
+                    target_path = os.path.join(temp_dir, target_name)
+                    
+                    # Extract single file
+                    with zip_ref.open(member) as source, open(target_path, "wb") as target:
+                        shutil.copyfileobj(source, target)
+                        
     except Exception as e:
         return None, [], f"Error extracting ZIP: {e}", {}
 
