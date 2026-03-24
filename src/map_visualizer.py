@@ -14,7 +14,7 @@ def generate_map_html(map_df, kakao_key, use_heatmap, center_lat, center_lon):
     # Prepare JSON for JS
     # Use Vectorized string methods
     def clean_series(series):
-        return series.astype(str).str.replace('"', '', regex=False).str.replace("'", "", regex=False).str.replace('\n', ' ', regex=False).replace({'nan': '', 'None': ''})
+        return series.astype(str).str.replace('"', '&quot;', regex=False).str.replace("'", "&#39;", regex=False).str.replace('\n', ' ', regex=False).str.replace('\\', '\\\\', regex=False).replace({'nan': '', 'None': ''})
 
     map_df['title'] = clean_series(map_df['사업장명'])
     map_df['addr'] = clean_series(map_df['소재지전체주소'].fillna(''))
@@ -250,6 +250,17 @@ def render_kakao_map(map_df, kakao_key, use_heatmap=False, user_context={}):
         
         <script type="text/javascript" src="https://dapi.kakao.com/v2/maps/sdk.js?appkey={kakao_key}&libraries=services,clusterer,drawing,visualization"></script>
         <script>
+            // --- SDK Check ---
+            if (typeof kakao === 'undefined' || typeof kakao.maps === 'undefined') {{
+                document.getElementById('map-overview').innerHTML = 
+                    '<div style="padding:40px; text-align:center; color:#d32f2f; font-family:sans-serif;">' +
+                    '<h3>❌ 카카오 맵 로드 실패</h3>' +
+                    '<p>API 키가 잘못되었거나 도메인이 등록되지 않았습니다.</p>' +
+                    '<p style="font-size:12px; color:#777;">(Kakao SDK is undefined)</p>' +
+                    '</div>';
+                // Stop further execution
+                throw new Error("Kakao Maps SDK not loaded");
+            }}
             // --- Legend Toggle Logic ---
             window.toggleLegend = function(e) {{
                 if(e) e.stopPropagation();
@@ -1019,6 +1030,12 @@ def render_folium_map(display_df, use_heatmap=False, user_context={}):
         st.warning("표시할 데이터가 없습니다.")
         return
 
+    # [PERFORMANCE] Enforce limit for Folium rendering to prevent browser crash
+    limit = 10000
+    if len(display_df) > limit:
+        st.warning(f"⚠️ 데이터가 너무 많아({len(display_df):,}건) 상위 {limit:,}개만 지도에 표시합니다. 필터를 사용하여 범위를 좁혀보세요.")
+        display_df = display_df.head(limit)
+
     # 1. Data Preparation & Date Formatting
     # Create a copy to modify for display
     map_data_df = display_df.copy()
@@ -1563,7 +1580,7 @@ def render_folium_map(display_df, use_heatmap=False, user_context={}):
                         var params = currentUrl.searchParams;
                         
                         params.set('visit_action', 'true');
-                        if(key) params.set('key', key); // [OVERHAUL] Pass explicit key
+                        if(item.record_key) params.set('key', item.record_key); // [FIX] Use item.record_key
                         params.set('title', title);
                         params.set('addr', addr);
                         
