@@ -2760,9 +2760,15 @@ if raw_df is not None:
         
         st.markdown("---")
         
-        # [FEATURE] Address search
-        st.markdown("##### 🔍 주소 검색")
         address_search = st.text_input("주소 검색 (예: 인천/삼산동)", value="", placeholder="주소 또는 업체명 입력...")
+        
+        st.markdown("---")
+        st.markdown("##### ⚙️ 시스템 관리")
+        if st.button("🧹 전체 캐시 초기화 (Reload)", help="오래된 데이터나 '스트림릿 찌꺼기'를 제거하고 앱을 새로고침합니다.", use_container_width=True):
+            st.cache_data.clear()
+            st.session_state.clear()
+            st.query_params.clear()
+            st.rerun()
     # [LOGGING] View/Filter Logging
     # We track changes in key filters
     
@@ -4125,21 +4131,30 @@ if raw_df is not None:
             st.markdown(f"**📍 조회된 업체**: {len(map_df):,} 개")
             
             # [DIAGNOSTIC] Show map data health
-            with st.expander("🛠 지도 데이터 진단 정보"):
-                st.write(f"전체 필터된 데이터: {len(map_df)}건")
-                st.write(f"사용 가능한 컬럼: {list(map_df.columns) if not map_df.empty else list(map_df_base.columns)}")
-                if not map_df_base.empty:
-                    valid_coords = map_df_base.dropna(subset=[c for c in ['lat', 'lon'] if c in map_df_base.columns])
-                    st.write(f"좌표(lat/lon)가 존재하는 전체 데이터: {len(valid_coords)}건")
+            with st.expander("🛠 지도 데이터 진단 정보", expanded=False):
+                st.write(f"📊 **전체 필터된 데이터**: {len(map_df):,}건")
+                
+                # Check column presence
+                cols = list(map_df.columns) if not map_df.empty else list(map_df_base.columns)
+                has_lat = 'lat' in cols
+                has_lon = 'lon' in cols
+                
+                if has_lat and has_lon:
+                    st.success("✅ 'lat', 'lon' 좌표 컬럼이 확인되었습니다.")
+                    valid_coords_count = len(map_df.dropna(subset=['lat', 'lon']))
+                    st.write(f"📍 **유효한 좌표 보유**: {valid_coords_count:,}건 / {len(map_df):,}건")
                     
-                    if 'lat' not in map_df_base.columns or 'lon' not in map_df_base.columns:
-                        st.error("❌ 'lat' 또는 'lon' 컬럼이 데이터에 존재하지 않습니다.")
-                    elif len(valid_coords) == 0:
-                        st.error("❌ 'lat', 'lon' 컬럼은 있으나 모든 값이 NaN(비어있음)입니다.")
-                    
-                    st.write(f"데이터 샘플 (상태명): {map_df_base['영업상태명'].unique().tolist() if '영업상태명' in map_df_base.columns else 'N/A'}")
+                    if valid_coords_count == 0 and len(map_df) > 0:
+                        st.error("❌ 컬럼은 존재하나 모든 좌표값이 비어(NaN) 있습니다. '데이터 새로고침'이 필요할 수 있습니다.")
                 else:
-                    st.warning("⚠️ 필터 결과 데이터가 0건입니다.")
+                    st.error("❌ 'lat' 또는 'lon' 컬럼이 누락되었습니다. 데이터 로딩 로직을 점검해야 합니다.")
+                
+                st.write(f"🔎 **사용 중인 컬럼**: `{', '.join(cols[:10])}...` ({len(cols)}개)")
+                
+                if not map_df.empty:
+                    st.write(f"🏷 **데이터 샘플 (상태명)**: {map_df['영업상태명'].unique().tolist() if '영업상태명' in map_df.columns else 'N/A'}")
+                else:
+                    st.warning("⚠️ 현재 필터 조건에 맞는 데이터가 0건입니다.")
 
             # [FEATURE] Visible Filter Summary for Verification
             filter_summary = []

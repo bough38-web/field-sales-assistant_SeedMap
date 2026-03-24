@@ -781,26 +781,23 @@ def load_fixed_coordinates_data(file_path: str):
         df.rename(columns=final_rename, inplace=True)
         
         # 2. Ensure Coordinates are numeric with robust cleaning
-        def clean_coord(x):
+        # 2. Ensure Coordinates are numeric with robust cleaning
+        def clean_lat(x):
             if pd.isna(x) or x is None: return np.nan
             try:
-                v = float(x)
-                if v == 0: return np.nan
-                if (33 < v < 43) or (124 < v < 132):
-                    return v
-                return np.nan
-            except:
-                s = str(x).strip().replace(',', '.')
-                try:
-                    v = float(s)
-                    if v == 0: return np.nan
-                    if (33 < v < 43) or (124 < v < 132):
-                        return v
-                    return np.nan
-                except: return np.nan
+                v = float(str(x).replace(',', '.'))
+                return v if (33 < v < 43) else np.nan
+            except: return np.nan
+
+        def clean_lon(x):
+            if pd.isna(x) or x is None: return np.nan
+            try:
+                v = float(str(x).replace(',', '.'))
+                return v if (124 < v < 132) else np.nan
+            except: return np.nan
             
-        if 'lat' in df.columns: df['lat'] = df['lat'].apply(clean_coord)
-        if 'lon' in df.columns: df['lon'] = df['lon'].apply(clean_coord)
+        if 'lat' in df.columns: df['lat'] = df['lat'].apply(clean_lat)
+        if 'lon' in df.columns: df['lon'] = df['lon'].apply(clean_lon)
         
         # 3. Generate record_key
         df['record_key'] = df.apply(
