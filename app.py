@@ -1,5 +1,6 @@
 # Deploy Timestamp: 2026-03-11 07:05:00 (Version: 20260301-v18-final-ready)
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import pandas as pd
 import altair as alt
@@ -69,6 +70,16 @@ is_maintenance = sys_config.get("maintenance_mode", False)
 # Initialize Session State (Earliest possible)
 if 'user_role' not in st.session_state:
     st.session_state.user_role = None
+if 'user_manager_name' not in st.session_state:
+    st.session_state.user_manager_name = None
+if 'user_branch' not in st.session_state:
+    st.session_state.user_branch = None
+if 'user_manager_code' not in st.session_state:
+    st.session_state.user_manager_code = None
+if 'visit_active' not in st.session_state:
+    st.session_state.visit_active = False
+if 'visit_data' not in st.session_state:
+    st.session_state.visit_data = {}
 
 if is_maintenance and st.session_state.user_role != 'admin':
     st.warning("🚧 **시스템 점검 안내**")
@@ -3154,7 +3165,7 @@ if raw_df is not None:
         cnt_closed = count_recent_events('폐업일자')
         cnt_mod = count_recent_events('최종수정시점')
 
-        user_display_name = st.session_state.user_manager_name or st.session_state.user_branch or "담당자"
+        user_display_name = st.session_state.get('user_manager_name') or st.session_state.get('user_branch') or "담당자"
 
         # Generate Message
         guide_msg = f"**{user_display_name}**님, 최근 15일간 데이터 분석 결과입니다.\n\n"
@@ -3209,8 +3220,9 @@ if raw_df is not None:
                         # 1. Calculate Stats
                         b_df = base_df[base_df['관리지사'] == b_name]
                         b_total = len(b_df)
-                        count_active = len(b_df[b_df['영업상태명'] == '영업/정상'])
-                        count_closed = len(b_df[b_df['영업상태명'] == '폐업'])
+                        # [FIX] Robust match for Active/Closed status (substring match)
+                        count_active = len(b_df[b_df['영업상태명'].str.contains('영업|정상', na=False)])
+                        count_closed = len(b_df[b_df['영업상태명'].str.contains('폐업', na=False)])
                         
                         # 2. Determine Style
                         is_selected = (b_name == sel_dashboard_branch)
@@ -3339,8 +3351,9 @@ if raw_df is not None:
                 mgr_label = item['label']
                 m_total = len(m_sub_df)
                 
-                m_active = len(m_sub_df[m_sub_df['영업상태명'] == '영업/정상'])
-                m_closed = len(m_sub_df[m_sub_df['영업상태명'] == '폐업'])
+                # [FIX] Robust match for Active/Closed status
+                m_active = len(m_sub_df[m_sub_df['영업상태명'].str.contains('영업|정상', na=False)])
+                m_closed = len(m_sub_df[m_sub_df['영업상태명'].str.contains('폐업', na=False)])
                 with m_cols[col_idx]:
                       current_sb_manager = st.session_state.get('sb_manager', "전체")
                       is_selected = (current_sb_manager == mgr_label)
@@ -4087,10 +4100,14 @@ if raw_df is not None:
 
             # Final Filtering
             map_df = map_df_base.copy()
-            if sel_map_region != "전체": map_df = map_df[map_df['관리지사'] == sel_map_region]
-            if sel_map_sales != "전체": map_df = map_df[map_df['SP담당'] == sel_map_sales]
-            if sel_map_type != "전체": map_df = map_df[map_df['업태구분명'] == sel_map_type]
-            if sel_map_status != "전체": map_df = map_df[map_df['영업상태명'] == sel_map_status]
+            # [FIX] Robust matching for Map Filters
+            if sel_map_region != "전체": map_df = map_df[map_df['관리지사'].str.contains(str(sel_map_region).strip(), na=False)]
+            if sel_map_sales != "전체": map_df = map_df[map_df['SP담당'].str.contains(str(sel_map_sales).strip(), na=False)]
+            if sel_map_type != "전체": map_df = map_df[map_df['업태구분명'].str.contains(str(sel_map_type).strip(), na=False)]
+            if sel_map_status != "전체": 
+                # Relaxed matching for status
+                status_query = '영업|정상' if '영업' in sel_map_status else sel_map_status
+                map_df = map_df[map_df['영업상태명'].str.contains(status_query, na=False)]
             
             # Apply activity status filter
             if sel_act_statuses:
@@ -4106,6 +4123,23 @@ if raw_df is not None:
                 map_df['record_key'] = map_df.apply(lambda row: utils.generate_record_key(row.get('사업장명'), row.get('소재지전체주소')), axis=1)
 
             st.markdown(f"**📍 조회된 업체**: {len(map_df):,} 개")
+            
+            # [DIAGNOSTIC] Show map data health
+            with st.expander("🛠 지도 데이터 진단 정보"):
+                st.write(f"전체 필터된 데이터: {len(map_df)}건")
+                st.write(f"사용 가능한 컬럼: {list(map_df.columns) if not map_df.empty else list(map_df_base.columns)}")
+                if not map_df_base.empty:
+                    valid_coords = map_df_base.dropna(subset=[c for c in ['lat', 'lon'] if c in map_df_base.columns])
+                    st.write(f"좌표(lat/lon)가 존재하는 전체 데이터: {len(valid_coords)}건")
+                    
+                    if 'lat' not in map_df_base.columns or 'lon' not in map_df_base.columns:
+                        st.error("❌ 'lat' 또는 'lon' 컬럼이 데이터에 존재하지 않습니다.")
+                    elif len(valid_coords) == 0:
+                        st.error("❌ 'lat', 'lon' 컬럼은 있으나 모든 값이 NaN(비어있음)입니다.")
+                    
+                    st.write(f"데이터 샘플 (상태명): {map_df_base['영업상태명'].unique().tolist() if '영업상태명' in map_df_base.columns else 'N/A'}")
+                else:
+                    st.warning("⚠️ 필터 결과 데이터가 0건입니다.")
 
             # [FEATURE] Visible Filter Summary for Verification
             filter_summary = []
@@ -4321,7 +4355,8 @@ if raw_df is not None:
                 
                 # [MODIFIED] Full-width Stacked Chart
                 st.markdown("**지사별 영업상태 누적 (Stacked)**")
-                df_stacked = df[df['영업상태명'].isin(['영업/정상', '폐업'])]
+                # [FIX] Robust match for Stacked Chart
+                df_stacked = df[df['영업상태명'].str.contains('영업|정상|폐업', na=False)]
                 
                 bar_base = alt.Chart(df_stacked).encode(
                     x=alt.X("관리지사", sort=GLOBAL_BRANCH_ORDER, title=None),
@@ -4412,7 +4447,8 @@ if raw_df is not None:
                     row = page_df.iloc[i + j]
                     
                     with cols[j]:
-                        status_cls = "status-open" if row['영업상태명'] == '영업/정상' else "status-closed"
+                        # [FIX] Robust class assignment
+                        status_cls = "status-open" if any(p in str(row['영업상태명']) for p in ['영업', '정상']) else "status-closed"
                         tel = row['소재지전화'] if pd.notna(row['소재지전화']) else ""
                         
                         def fmt_date(d):
@@ -4796,7 +4832,7 @@ if raw_df is not None:
                 
                 if submitted:
                     if voc_subj and voc_cont:
-                        u_name = st.session_state.user_manager_name or st.session_state.user_branch or "Unknown"
+                        u_name = st.session_state.get('user_manager_name') or st.session_state.get('user_branch') or "Unknown"
                         u_region = st.session_state.user_branch or "Unknown"
                         if voc_manager.add_voc_request(st.session_state.user_role, u_name, u_region, voc_subj, voc_cont, voc_pri):
                             st.success("✅ 요청이 성공적으로 접수되었습니다. 관리자가 확인 후 답변드리겠습니다.")
