@@ -299,8 +299,8 @@ def merge_activity_status(df: pd.DataFrame) -> pd.DataFrame:
              
     return df
 
-@st.cache_data
-def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: Any, dist_mtime: Optional[float] = None) -> Tuple[Union[pd.DataFrame, None], List[Dict], Optional[str], Dict[str, int]]:
+@st.cache_data(ttl=3600, show_spinner="데이터 처리 중...") # Added TTL and salt implicitly via code change
+def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: Any, dist_mtime: Optional[float] = None, version: str = "v1.1") -> Tuple[Union[pd.DataFrame, None], List[Dict], Optional[str], Dict[str, int]]:
     """
     Loads data from uploads, extracts ZIP, processes CSVs, and merges with district data.
     Returns: (DataFrame, ManagerInfo, ErrorMessage, StatsDict)
@@ -423,14 +423,38 @@ def load_and_process_data(zip_file_path_or_obj: Any, district_file_path_or_obj: 
                                  1: '영업상태명', 3: '관리번호', 4: '인허가일자', 7: '영업상태명', 10: '최종수정시점',
                                  15: '소재지전체주소', 16: '도로명전체주소', 19: '좌표정보(X)', 20: '좌표정보(Y)', 22: '사업장명'
                              }
-                             # More robust headerless mapping for this specific format seen in head:
-                             # 0:자산(?), 1:상호/상태(?), 2:날짜, 3:자산(?), 4:190106(X), 5:441792(Y), 15:주소
-                             if num_cols >= 26:
-                                 # My head-sample had: 0:ID, 1:NAME, 2:DATE, 3:ID, 4:X, 5:Y, 15:ADDR
-                                 # Standard LocalData: X is usually col 26 (idx 25?), ADDR is idx 15
-                                 # We'll assign names based on content analysis if index is hard to predict
-                                 # OR just search for numeric-ish columns in range 150k-500k
-                                 df.rename(columns={1: '사업장명', 4: '좌표정보(X)', 5: '좌표정보(Y)', 15: '소재지전체주소', 2: '인허가일자'}, inplace=True)
+                             # More robust headerless mapping: Verify content
+                             if num_cols >= 20: 
+                                 # Heuristic: Find columns with large numeric values (Bessel)
+                                 # or values in WGS84 range
+                                 x_idx, y_idx = None, None
+                                 for col_idx in range(min(num_cols, 30)):
+                                     sample_vals = pd.to_numeric(df.iloc[:20, col_idx], errors='coerce').dropna()
+                                     if not sample_vals.empty:
+                                         med = sample_vals.median()
+                                         if 150000 < med < 250000: x_idx = col_idx
+                                         if 400000 < med < 550000: y_idx = col_idx
+                                         if 124 < med < 132: x_idx = col_idx # Lon
+                                         if 33 < med < 43: y_idx = col_idx   # Lat
+                                 
+                                 # Standard fallback if heuristic failed
+                                 if x_idx is None: x_idx = 4 if num_cols > 4 else None
+                                 if y_idx is None: y_idx = 5 if num_cols > 5 else None
+                                 
+                                 rename_map_h = {}
+                                 if x_idx is not None: rename_map_h[x_idx] = '좌표정보(X)'
+                                 if y_idx is not None: rename_map_h[y_idx] = '좌표정보(Y)'
+                                 
+                                 # Address is usually around index 15 in standard LocalData
+                                 for a_idx in [15, 16, 17, 18, 14]:
+                                     if a_idx < num_cols:
+                                         sample_a = str(df.iloc[0, a_idx])
+                                         if '시' in sample_a or '도' in sample_a:
+                                             rename_map_h[a_idx] = '소재지전체주소'
+                                             break
+                                             
+                                 if rename_map_h:
+                                     df.rename(columns=rename_map_h, inplace=True)
                              used_encoding = enc
                              break
                 except Exception:
